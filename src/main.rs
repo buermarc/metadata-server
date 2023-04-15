@@ -1,11 +1,9 @@
-use actix::*;
+use actix_web::error::ErrorInternalServerError;
 use actix_web::http::StatusCode;
 use actix_web::{middleware::Logger, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use expanduser::expanduser;
+use rand::seq::IteratorRandom;
 use std::collections::{HashMap, HashSet};
-
-use actix_web::rt::time::sleep;
-use std::time::Duration;
 
 use std::sync::{Arc, RwLock};
 
@@ -13,8 +11,6 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use anyhow::Context;
-
-use ulid::Ulid;
 
 #[derive(Serialize, Deserialize)]
 pub struct Config {
@@ -43,7 +39,7 @@ impl ::std::default::Default for Config {
 #[derive(Clone)]
 struct Metadata {
     snap_to_cache_server: HashMap<String, HashMap<usize, String>>,
-    cache_server_to_snap: HashMap<String, Vec<(String, usize)>>,
+    cache_server_to_snap: HashMap<String, HashSet<(String, usize)>>,
     known_hosts: HashSet<String>,
 }
 
@@ -121,14 +117,14 @@ impl Metadata {
     ) -> anyhow::Result<()> {
         match self.cache_server_to_snap.get_mut(simulation) {
             Some(entries) => {
-                entries.push((address.to_string(), snapshot_id));
+                entries.insert((address.to_string(), snapshot_id));
                 return Ok(());
             }
             None => {
-                self.cache_server_to_snap.insert(
-                    simulation.to_string(),
-                    vec![(address.to_string(), snapshot_id)],
-                );
+                let mut hashset = HashSet::new();
+                hashset.insert((address.to_string(), snapshot_id));
+                self.cache_server_to_snap
+                    .insert(simulation.to_string(), hashset);
                 return Ok(());
             }
         }
@@ -142,6 +138,23 @@ impl Metadata {
     ) -> anyhow::Result<()> {
         self.add_snap_to_cache_server(simulation, snapshot_id, address)?;
         self.add_cache_server_to_snap(simulation, snapshot_id, address)?;
+        Ok(())
+    }
+
+    fn del_snap(
+        &mut self,
+        simulation: &String,
+        snapshot_id: usize,
+        address: &String,
+    ) -> anyhow::Result<()> {
+        if let Some(known_snaps_for_host) = self.cache_server_to_snap.get_mut(address) {
+            known_snaps_for_host.remove(&(simulation.to_string(), snapshot_id));
+        }
+        if let Some(know_snaps_for_simulation) = self.snap_to_cache_server.get_mut(simulation) {
+            know_snaps_for_simulation
+                .remove_entry(&snapshot_id)
+                .context("Snap was not contained.")?;
+        }
         Ok(())
     }
 
@@ -168,6 +181,11 @@ impl Metadata {
                     .get(&snapshot_id)
                     .and_then(|address| Some(address.clone()))
             })
+    }
+
+    fn pick_random_host(&self) -> Option<String> {
+        let mut rng = rand::thread_rng();
+        self.known_hosts.iter().choose(&mut rng).cloned()
     }
 }
 
@@ -226,6 +244,51 @@ async fn add_snap(
     HttpResponse::new(StatusCode::OK)
 }
 
+async fn del_snap(
+    req: HttpRequest,
+    cache_request: web::Json<CacheRequest>,
+    metadata: web::Data<Arc<RwLock<Metadata>>>,
+) -> impl Responder {
+    let address = req
+        .headers()
+        .get("user-agent")
+        .expect("No user agent was provided.")
+        .to_str()
+        .expect("Failed to generate string.")
+        .to_string();
+
+    log::info!("Deleting snap.");
+    {
+        let mut metadata = metadata.write().expect("Failed to aquire write");
+        match metadata.del_snap(
+            &cache_request.simulation,
+            cache_request.snapshot_id,
+            &address,
+        ) {
+            Ok(_) => {}
+            Err(_) => log::warn!("Failed to del snap"),
+        }
+    }
+
+    HttpResponse::new(StatusCode::OK)
+}
+
+async fn snap_redirect(
+    req: HttpRequest,
+    params: web::Path<(String, usize)>,
+    metadata: web::Data<Arc<RwLock<Metadata>>>,
+) -> Result<impl Responder, actix_web::Error> {
+    let (simulation, snapshot_id) = (params.0.clone(), params.1);
+    let metadata = metadata.read().expect("Failed to aquire read");
+    match metadata
+        .find_host_for_snap(&simulation, snapshot_id)
+        .or_else(|| metadata.pick_random_host())
+    {
+        Some(address) => Ok(web::Redirect::to(address + req.path())),
+        None => Err(ErrorInternalServerError("Could not find a host")),
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
@@ -240,6 +303,15 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(metadata.clone()))
             .route("/ping", web::post().to(ping))
             .route("/add_snap", web::post().to(add_snap))
+            .route("/del_snap", web::post().to(del_snap))
+            .route(
+                "/v1/get/splines/{simulation}/{snapshot_id}",
+                web::post().to(snap_redirect),
+            )
+            .route(
+                "/v1/get/init/{simulation}/{snapshot_id}",
+                web::get().to(snap_redirect),
+            )
             .wrap(Logger::default())
     })
     .workers(2)
