@@ -1,14 +1,17 @@
+use actix_cors::Cors;
 use actix_web::error::ErrorInternalServerError;
 use actix_web::http::StatusCode;
 use actix_web::{middleware::Logger, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use expanduser::expanduser;
-use rand::seq::IteratorRandom;
 use std::collections::{HashMap, HashSet};
 
 use std::sync::{Arc, RwLock};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use anyhow::Context;
 
@@ -158,7 +161,7 @@ impl Metadata {
         Ok(())
     }
 
-    fn remove_cache_server(&mut self, address: String) -> anyhow::Result<()> {
+    fn remove_cache_server(&mut self, address: String) {
         // Go through all known snaps of this host and remove them
         if let Some(entries) = self.cache_server_to_snap.get(&address) {
             for (simulation, snapshot_id) in entries {
@@ -170,7 +173,7 @@ impl Metadata {
 
         // Remove the info about the host
         self.cache_server_to_snap.remove(&address);
-        Ok(())
+        self.known_hosts.remove(&address);
     }
 
     fn find_host_for_snap(&self, simulation: &String, snapshot_id: usize) -> Option<String> {
@@ -183,9 +186,18 @@ impl Metadata {
             })
     }
 
-    fn pick_random_host(&self) -> Option<String> {
-        let mut rng = rand::thread_rng();
-        self.known_hosts.iter().choose(&mut rng).cloned()
+    fn pick_random_host(&self, simulation: &String, snapshot_id: usize) -> Option<String> {
+        // Try to determine host somewhat deterministically, so that as long as the length of
+        // known_hosts does not change we return the same element
+        if self.known_hosts.len() == 0 {
+            return None;
+        }
+        let mut hasher = DefaultHasher::new();
+        simulation.hash(&mut hasher);
+        snapshot_id.hash(&mut hasher);
+        let hash = hasher.finish();
+        let index = (hash % self.known_hosts.len() as u64) as usize;
+        self.known_hosts.iter().nth(index).cloned()
     }
 }
 
@@ -212,6 +224,22 @@ async fn ping(req: HttpRequest, metadata: web::Data<Arc<RwLock<Metadata>>>) -> i
         log::info!("Host already known.");
     }
 
+    HttpResponse::new(StatusCode::OK)
+}
+
+async fn goodbye(req: HttpRequest, metadata: web::Data<Arc<RwLock<Metadata>>>) -> impl Responder {
+    let address = req
+        .headers()
+        .get("user-agent")
+        .expect("No user agent was provided.")
+        .to_str()
+        .expect("Failed to generate string.")
+        .to_string();
+    log::info!("Trying to delete host.");
+    {
+        let mut metadata = metadata.write().expect("Failed to aquire write");
+        metadata.remove_cache_server(address);
+    }
     HttpResponse::new(StatusCode::OK)
 }
 
@@ -282,7 +310,7 @@ async fn snap_redirect(
     let metadata = metadata.read().expect("Failed to aquire read");
     match metadata
         .find_host_for_snap(&simulation, snapshot_id)
-        .or_else(|| metadata.pick_random_host())
+        .or_else(|| metadata.pick_random_host(&simulation, snapshot_id))
     {
         Some(address) => Ok(web::Redirect::to(address + req.path())),
         None => Err(ErrorInternalServerError("Could not find a host")),
@@ -299,9 +327,11 @@ async fn main() -> std::io::Result<()> {
 
     log::info!("starting HTTP server at http://localhost:9999");
     HttpServer::new(move || {
+        let cors = Cors::permissive();
         App::new()
             .app_data(web::Data::new(metadata.clone()))
             .route("/ping", web::post().to(ping))
+            .route("/goodbye", web::post().to(goodbye))
             .route("/add_snap", web::post().to(add_snap))
             .route("/del_snap", web::post().to(del_snap))
             .route(
@@ -313,6 +343,7 @@ async fn main() -> std::io::Result<()> {
                 web::get().to(snap_redirect),
             )
             .wrap(Logger::default())
+            .wrap(cors)
     })
     .workers(2)
     .bind(("127.0.0.1", 9999))?
